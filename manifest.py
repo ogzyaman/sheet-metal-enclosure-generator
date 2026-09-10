@@ -1,8 +1,8 @@
-"""cadkit/manifest.py'den kopyalandı — bu repo cadkit'e bağımlı değil.
+"""Copied from cadkit/manifest.py -- this repo does not depend on cadkit.
 
-Manifest CSV/XLSX yazımı. lib/CLAUDE.md'de tarif edilen kasıtlı
-duplikasyon deseniyle aynı: portfolio repoları public/bağımsız, private
-lib/cadkit paketine bağlanmıyor.
+Manifest CSV/XLSX writer. Deliberate duplication, same pattern used
+across this author's portfolio repos: public/standalone repos never
+link against the private lib/cadkit package.
 """
 import csv
 
@@ -29,7 +29,7 @@ def build_manifest_fields(formats, numeric_fields=NUMERIC_FIELDS):
 
 
 def _to_number(value):
-    """Tam sayıysa int, değilse float döner — Excel'de 60.0 yerine 60 görünsün diye."""
+    """Returns int for whole numbers, float otherwise -- so Excel shows 60, not 60.0."""
     f = float(value)
     return int(f) if f.is_integer() else f
 

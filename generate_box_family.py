@@ -1,26 +1,59 @@
-"""CSV'den sac kutu ailesi (delik/yuva/kesik YOK, sadece kutu).
-freecadcmd ile calisir:
-  freecadcmd generate_box_family.py --pass <input.csv> <out_dir>
+"""Generates a family of sheet-metal boxes from CSV, with optional
+holes/slots/rectangular cutouts (features).
 
-Girdi CSV sutunlari:
+Run with freecadcmd:
+  freecadcmd generate_box_family.py --pass <boxes.csv> <features.csv> <out_dir>
+
+boxes.csv columns:
   variant_id, inner_length_mm, inner_width_mm, inner_height_mm,
   thickness_mm, bend_radius_mm, k_factor
 
-Donusum (SheetMetal girdisi):
+features.csv columns:
+  variant_id, face, type, u_mm, v_mm, size1_mm, size2_mm, rotation_deg
+  face: base | front (y=0) | back | left (x=0) | right
+  type: hole (size1=diameter) | slot (size1=TOTAL length, size2=width,
+        rotation 0 = long axis horizontal) | rect (size1=horizontal,
+        size2=vertical)
+  Position (center), referenced from the INNER surface:
+    base: from the front-left inner corner, u along length (x),
+          v along width (y).
+    wall: viewed from outside; u from the wall's left inner edge
+          (horizontal), v from the base's top surface (z=T) upward.
+
+Conversion (SheetMetal input):
   L = inner_length - 2R, W = inner_width - 2R, leg = inner_height - R
 
-Her varyant icin: STEP + katmanli DXF (CUT/BEND) + manifest (bu repo
-icindeki manifest.py, cadkit'e bagimli degil). Taban yuzu secimi:
-deterministik kural (merkezi z=0, disa donuk normali -Z olan tek
-duzlem yuz; tek eslesme yoksa DUR).
+Validation (before production). w,h = the feature's total horizontal/
+vertical footprint after rotation:
+  base: R <= u-w/2  and  u+w/2 <= inner_length - R
+        R <= v-h/2  and  v+h/2 <= inner_width - R
+  wall: R <= u-w/2  and  u+w/2 <= wall's inner span - R
+        R <= v-h/2  and  v+h/2 <= inner_height   (no -R at the top --
+        the open rim is not a bend zone)
 
-freecadcmd notu: ekstra CLI argumanlari --pass'tan SONRA verilmeli,
-yoksa FreeCAD onlari dosya olarak acmaya calisir. Script FreeCAD'in
-kendi baslatma baglaminda calistigi icin __name__ "__main__" OLMUYOR
--- main() bu yuzden kosulsuz cagriliyor.
+If ANY feature row for a variant fails validation, that whole variant
+is NOT produced: no STEP/DXF are written, and any STEP/DXF left over
+from a previous run for that variant are deleted first. manifest.csv
+records status="failed: <which feature, why>" for that variant.
+features_manifest.csv still records the outcome of every feature row
+independently, regardless of whether the variant as a whole was built.
+
+Per successful variant: STEP + layered DXF (CUT/BEND) + manifest.py
+(bundled in this repo, no cadkit dependency). Base-face selection:
+deterministic rule (the single planar face whose center is at z=0 and
+whose outward normal is exactly -Z; anything other than one match is
+a hard stop).
+
+freecadcmd note: extra CLI arguments must come after --pass, otherwise
+FreeCAD tries to open them as documents. The SheetMetal addon folder
+is added to sys.path automatically by freecadcmd, no need to append it.
+The script runs inside FreeCAD's own startup context, so __name__ is
+NOT "__main__" -- main() is therefore called unconditionally.
 """
 import csv
+import math
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import FreeCAD as App
@@ -39,6 +72,11 @@ NUMERIC_FIELDS = [
     "thickness_mm", "bend_radius_mm", "k_factor",
 ]
 FORMATS = ["step", "dxf"]
+
+FEATURE_FIELDS = [
+    "variant_id", "face", "type", "u_mm", "v_mm", "size1_mm", "size2_mm",
+    "rotation_deg", "status", "reason",
+]
 
 
 def select_base_face(shape):
@@ -59,7 +97,7 @@ def select_base_face(shape):
         if abs(n.x) < 1e-6 and abs(n.y) < 1e-6 and abs(n.z - (-1.0)) < 1e-6:
             matches.append(i + 1)
     if len(matches) != 1:
-        raise SystemExit(f"DUR: taban dis yuzu kurali {len(matches)} eslesme buldu (1 beklenirdi).")
+        raise SystemExit(f"STOP: base-face rule found {len(matches)} matches (expected 1).")
     return f"Face{matches[0]}"
 
 
@@ -96,7 +134,209 @@ def measure_interior(shape, L, W, T):
     return inner_length, inner_width, inner_height
 
 
-def build_variant(row, out_dir):
+def find_wall_mid(shape, axis, positive_side, threshold):
+    """Mean coordinate (along `axis`, 'x' or 'y') of the wall's inner+outer
+    skin faces on the given side (positive_side selects > threshold, else
+    < threshold). Same face-detection pattern used throughout this
+    project's exploratory scripts (normal aligned to axis, area large
+    enough to exclude corner-relief slivers)."""
+    vals = []
+    for f in shape.Faces:
+        if not isinstance(f.Surface, Part.Plane):
+            continue
+        n = f.Surface.Axis
+        c = f.CenterOfMass
+        if f.Area < 1000:
+            continue
+        if axis == "x" and abs(n.x) > 0.99 and abs(n.y) < 0.01:
+            val = c.x
+        elif axis == "y" and abs(n.y) > 0.99 and abs(n.x) < 0.01:
+            val = c.y
+        else:
+            continue
+        if (val > threshold) == positive_side:
+            vals.append(val)
+    if not vals:
+        raise SystemExit(f"STOP: no wall face found (axis={axis}, positive_side={positive_side}).")
+    return sum(vals) / len(vals)
+
+
+def face_geometry(face, u, v, L, W, R, T, box_shape):
+    """Resolves a feature's face/(u,v) spec into:
+      center -- world Vector of the feature center (the axis normal to
+                the face is already resolved: T/2 for base, the detected
+                wall mid-thickness coordinate for walls)
+      p_hat  -- unit Vector: world direction of +u (local horizontal)
+      q_hat  -- unit Vector: world direction of +v (local vertical)
+      n_hat  -- unit Vector: cut-through (thickness) direction
+    """
+    if face == "base":
+        cx, cy = u - R, v - R
+        center = App.Vector(cx, cy, T / 2.0)
+        return center, App.Vector(1, 0, 0), App.Vector(0, 1, 0), App.Vector(0, 0, 1)
+    if face == "front":
+        cx, cz = u - R, T + v
+        y_mid = find_wall_mid(box_shape, "y", False, W / 2.0)
+        center = App.Vector(cx, y_mid, cz)
+        return center, App.Vector(1, 0, 0), App.Vector(0, 0, 1), App.Vector(0, 1, 0)
+    if face == "back":
+        cx, cz = (L + R) - u, T + v
+        y_mid = find_wall_mid(box_shape, "y", True, W / 2.0)
+        center = App.Vector(cx, y_mid, cz)
+        return center, App.Vector(-1, 0, 0), App.Vector(0, 0, 1), App.Vector(0, 1, 0)
+    if face == "left":
+        cy, cz = (W + R) - u, T + v
+        x_mid = find_wall_mid(box_shape, "x", False, L / 2.0)
+        center = App.Vector(x_mid, cy, cz)
+        return center, App.Vector(0, -1, 0), App.Vector(0, 0, 1), App.Vector(1, 0, 0)
+    if face == "right":
+        cy, cz = u - R, T + v
+        x_mid = find_wall_mid(box_shape, "x", True, L / 2.0)
+        center = App.Vector(x_mid, cy, cz)
+        return center, App.Vector(0, 1, 0), App.Vector(0, 0, 1), App.Vector(1, 0, 0)
+    raise ValueError(f"unknown face: {face}")
+
+
+def feature_footprint(ftype, size1, size2, rotation_deg):
+    """Bounding w,h (rotation-aware) of the feature's footprint, centered
+    on its own local origin -- used only for validation."""
+    theta = math.radians(rotation_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+
+    def rot_bbox(points):
+        rw = [abs(px * cos_t - py * sin_t) for px, py in points]
+        rh = [abs(px * sin_t + py * cos_t) for px, py in points]
+        return 2 * max(rw), 2 * max(rh)
+
+    if ftype == "hole":
+        return size1, size1
+    if ftype == "rect":
+        hw, hh = size1 / 2.0, size2 / 2.0
+        return rot_bbox([(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)])
+    if ftype == "slot":
+        total_len, width = size1, size2
+        half_center_dist = (total_len - width) / 2.0
+        r = width / 2.0
+        w, h = rot_bbox([(-half_center_dist, 0.0), (half_center_dist, 0.0)])
+        return w + 2 * r, h + 2 * r
+    raise ValueError(f"unknown feature type: {ftype}")
+
+
+def build_feature_cutter(ftype, size1, size2, rotation_deg, center, p_hat, q_hat, n_hat, depth):
+    theta = math.radians(rotation_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+
+    def world_pt(p, q):
+        pr = p * cos_t - q * sin_t
+        qr = p * sin_t + q * cos_t
+        return center + p_hat * pr + q_hat * qr - n_hat * (depth / 2.0)
+
+    if ftype == "hole":
+        r = size1 / 2.0
+        return Part.makeCylinder(r, depth, center - n_hat * (depth / 2.0), n_hat)
+
+    if ftype == "rect":
+        w, h = size1, size2
+        pts = [world_pt(-w / 2, -h / 2), world_pt(w / 2, -h / 2),
+               world_pt(w / 2, h / 2), world_pt(-w / 2, h / 2)]
+        wire = Part.makePolygon(pts + [pts[0]])
+        face_ = Part.Face(wire)
+        return face_.extrude(n_hat * depth)
+
+    if ftype == "slot":
+        total_len, width = size1, size2
+        r = width / 2.0
+        half_center_dist = (total_len - width) / 2.0
+        c1 = world_pt(-half_center_dist, 0.0)
+        c2 = world_pt(half_center_dist, 0.0)
+        cyl1 = Part.makeCylinder(r, depth, c1, n_hat)
+        cyl2 = Part.makeCylinder(r, depth, c2, n_hat)
+        pts = [world_pt(-half_center_dist, -r), world_pt(half_center_dist, -r),
+               world_pt(half_center_dist, r), world_pt(-half_center_dist, r)]
+        wire = Part.makePolygon(pts + [pts[0]])
+        mid_face = Part.Face(wire)
+        mid_box = mid_face.extrude(n_hat * depth)
+        return cyl1.fuse(cyl2).fuse(mid_box)
+
+    raise ValueError(f"unknown feature type: {ftype}")
+
+
+def validate_features(feature_rows, L, W, R, inner_length, inner_width, inner_height):
+    """Validates every feature row independently (no geometry touched
+    yet). Returns a list of parsed dicts, each carrying its own
+    status/reason plus (if valid) the fields needed to build its cutter."""
+    parsed_rows = []
+    for row in feature_rows:
+        face = row["face"].strip()
+        ftype = row["type"].strip()
+        u = float(row["u_mm"])
+        v = float(row["v_mm"])
+        size1 = float(row["size1_mm"])
+        size2 = float(row["size2_mm"]) if row.get("size2_mm") not in (None, "") else 0.0
+        rotation = float(row["rotation_deg"]) if row.get("rotation_deg") not in (None, "") else 0.0
+
+        parsed = {
+            "variant_id": row["variant_id"], "face": face, "type": ftype,
+            "u_mm": u, "v_mm": v, "size1_mm": size1, "size2_mm": size2,
+            "rotation_deg": rotation, "status": "ok", "reason": "",
+        }
+
+        try:
+            if face not in ("base", "front", "back", "left", "right"):
+                raise ValueError(f"unknown face: {face}")
+
+            w, h = feature_footprint(ftype, size1, size2, rotation)
+
+            if face == "base":
+                horiz_max, vert_max = inner_length, inner_width
+                vert_top_margin = R
+            else:
+                horiz_max = inner_length if face in ("front", "back") else inner_width
+                vert_max = inner_height
+                vert_top_margin = 0.0
+
+            ok_u = (R <= u - w / 2) and (u + w / 2 <= horiz_max - R)
+            ok_v = (R <= v - h / 2) and (v + h / 2 <= vert_max - vert_top_margin)
+
+            if not ok_u:
+                raise ValueError(f"u out of range: u={u} w={w:.4f} allowed=[{R},{horiz_max - R}]")
+            if not ok_v:
+                raise ValueError(f"v out of range: v={v} h={h:.4f} allowed=[{R},{vert_max - vert_top_margin}]")
+
+        except Exception as e:
+            parsed["status"] = "failed"
+            parsed["reason"] = str(e)
+
+        parsed_rows.append(parsed)
+    return parsed_rows
+
+
+def cut_features(box_shape, parsed_rows, L, W, R, T):
+    """Cuts every (already validated) feature into the shape, in order.
+    Assumes all rows in parsed_rows have status == 'ok'."""
+    shape = box_shape
+    for row in parsed_rows:
+        center, p_hat, q_hat, n_hat = face_geometry(row["face"], row["u_mm"], row["v_mm"], L, W, R, T, shape)
+        depth = 4.0 if row["face"] == "base" else 2.0
+        cutter = build_feature_cutter(
+            row["type"], row["size1_mm"], row["size2_mm"], row["rotation_deg"],
+            center, p_hat, q_hat, n_hat, depth,
+        )
+        new_shape = shape.cut(cutter)
+        if not new_shape.isValid():
+            raise SystemExit(f"STOP: shape invalid after cutting feature {row}.")
+        shape = new_shape
+    return shape
+
+
+def remove_stale_outputs(out_dir, variant_id):
+    """Deletes this variant's own previous STEP/DXF (if any) before this
+    run attempts to (re)produce them -- leaves every other file alone."""
+    (out_dir / "step" / f"{variant_id}.step").unlink(missing_ok=True)
+    (out_dir / "dxf" / f"{variant_id}.dxf").unlink(missing_ok=True)
+
+
+def build_variant(row, features_by_variant, out_dir):
     variant_id = row["variant_id"]
     inner_length = float(row["inner_length_mm"])
     inner_width = float(row["inner_width_mm"])
@@ -108,6 +348,8 @@ def build_variant(row, out_dir):
     L = inner_length - 2 * R
     W = inner_width - 2 * R
     leg = inner_height - R
+
+    remove_stale_outputs(out_dir, variant_id)
 
     doc = App.newDocument(f"v_{variant_id}")
 
@@ -139,9 +381,10 @@ def build_variant(row, out_dir):
     doc.recompute()
 
     if not box.Shape.isValid():
-        raise SystemExit(f"DUR: {variant_id} gecersiz geometri.")
+        raise SystemExit(f"STOP: {variant_id} produced invalid geometry.")
 
-    # --- interior measurement ---
+    # Interior measurement is always computed, even for a variant that
+    # will end up failed -- it doesn't touch the filesystem.
     meas_L, meas_W, meas_H = measure_interior(box.Shape, L, W, T)
     diff = {
         "inner_length_mm": meas_L - inner_length,
@@ -149,17 +392,48 @@ def build_variant(row, out_dir):
         "inner_height_mm": meas_H - inner_height,
     }
 
-    # --- STEP export ---
+    feature_rows = features_by_variant.get(variant_id, [])
+    parsed_rows = validate_features(feature_rows, L, W, R, inner_length, inner_width, inner_height)
+    failed_rows = [r for r in parsed_rows if r["status"] == "failed"]
+
+    base_result = {
+        "variant_id": variant_id, "L": L, "W": W, "leg": leg,
+        "measured": (meas_L, meas_W, meas_H), "diff": diff,
+        "feature_status_rows": parsed_rows,
+    }
+
+    if failed_rows:
+        reasons = "; ".join(f"{r['face']}/{r['type']} u={r['u_mm']} v={r['v_mm']}: {r['reason']}" for r in failed_rows)
+        App.closeDocument(doc.Name)
+        base_result["manifest_row"] = {
+            "variant_id": variant_id,
+            "inner_length_mm": inner_length,
+            "inner_width_mm": inner_width,
+            "inner_height_mm": inner_height,
+            "thickness_mm": T,
+            "bend_radius_mm": R,
+            "k_factor": K,
+            "step_file": "",
+            "dxf_file": "",
+            "status": f"failed: {reasons}",
+        }
+        base_result["produced"] = False
+        return base_result
+
+    final_shape = cut_features(box.Shape, parsed_rows, L, W, R, T)
+    final_obj = doc.addObject("Part::Feature", "Final")
+    final_obj.Shape = final_shape
+    doc.recompute()
+
     step_rel = f"step/{variant_id}.step"
     step_path = out_dir / step_rel
     step_path.parent.mkdir(parents=True, exist_ok=True)
-    Part.export([box], str(step_path))
+    Part.export([final_obj], str(step_path))
 
-    # --- unfold + layered DXF ---
-    flat_face = select_base_face(box.Shape)
+    flat_face = select_base_face(final_obj.Shape)
     bac = BendAllowanceCalculator.from_single_value(K, "ansi")
     sel_face, unfolded_shape, bend_lines, root_normal, bend_infodata = SheetMetalNewUnfolder.getUnfold(
-        bac, box, flat_face
+        bac, final_obj, flat_face
     )
     sketch_profile, inner_wires, hole_wires = SketchExtraction.extract_manually(unfolded_shape, root_normal)
     transform = SketchExtraction.move_to_origin(sketch_profile, sel_face)
@@ -181,9 +455,15 @@ def build_variant(row, out_dir):
     dxf_path.parent.mkdir(parents=True, exist_ok=True)
     importDXF.export([cut_sketch, bend_sketch], str(dxf_path))
 
+    cut_geo_count = len(cut_sketch.Geometry)
+    bend_geo_count = len(bend_sketch.Geometry)
+    cut_types = dict(Counter(g.TypeId for g in cut_sketch.Geometry))
+    bend_types = dict(Counter(g.TypeId for g in bend_sketch.Geometry))
+
     App.closeDocument(doc.Name)
 
-    manifest_row = {
+    base_result["produced"] = True
+    base_result["manifest_row"] = {
         "variant_id": variant_id,
         "inner_length_mm": inner_length,
         "inner_width_mm": inner_width,
@@ -195,30 +475,37 @@ def build_variant(row, out_dir):
         "dxf_file": dxf_rel,
         "status": "ok",
     }
-
-    return {
-        "variant_id": variant_id,
-        "L": L, "W": W, "leg": leg,
-        "measured": (meas_L, meas_W, meas_H),
-        "diff": diff,
-        "dxf_bbox": (dxf_bbox.XMin, dxf_bbox.XMax, dxf_bbox.YMin, dxf_bbox.YMax),
-        "manifest_row": manifest_row,
-    }
+    base_result["dxf_bbox"] = (dxf_bbox.XMin, dxf_bbox.XMax, dxf_bbox.YMin, dxf_bbox.YMax)
+    base_result["cut_geo_count"] = cut_geo_count
+    base_result["cut_geo_types"] = cut_types
+    base_result["bend_geo_count"] = bend_geo_count
+    base_result["bend_geo_types"] = bend_types
+    return base_result
 
 
 def main():
     args = sys.argv[sys.argv.index("--pass") + 1:]
-    csv_path = Path(args[0])
-    out_dir = Path(args[1])
+    boxes_csv = Path(args[0])
+    features_csv = Path(args[1])
+    out_dir = Path(args[2])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+    with open(boxes_csv, newline="", encoding="utf-8") as f:
+        box_rows = list(csv.DictReader(f))
+
+    features_by_variant = defaultdict(list)
+    if features_csv.exists():
+        with open(features_csv, newline="", encoding="utf-8") as f:
+            for frow in csv.DictReader(f):
+                features_by_variant[frow["variant_id"]].append(frow)
 
     manifest_rows = []
-    for row in rows:
-        result = build_variant(row, out_dir)
+    all_feature_status = []
+    for row in box_rows:
+        result = build_variant(row, features_by_variant, out_dir)
         manifest_rows.append(result["manifest_row"])
+        all_feature_status.extend(result["feature_status_rows"])
+
         print(f"--- {result['variant_id']} ---")
         print(f"  SheetMetal input: L={result['L']:.4f} W={result['W']:.4f} leg={result['leg']:.4f}")
         mL, mW, mH = result["measured"]
@@ -226,13 +513,25 @@ def main():
         d = result["diff"]
         print(f"  diff vs CSV (mm): length={d['inner_length_mm']:+.4f} "
               f"width={d['inner_width_mm']:+.4f} height={d['inner_height_mm']:+.4f}")
-        bx = result["dxf_bbox"]
-        print(f"  DXF bbox: x[{bx[0]:.4f},{bx[1]:.4f}] y[{bx[2]:.4f},{bx[3]:.4f}]")
+
+        if result["produced"]:
+            bx = result["dxf_bbox"]
+            print(f"  DXF bbox: x[{bx[0]:.4f},{bx[1]:.4f}] y[{bx[2]:.4f},{bx[3]:.4f}]")
+            print(f"  CUT: {result['cut_geo_count']} ({result['cut_geo_types']})")
+            print(f"  BEND: {result['bend_geo_count']} ({result['bend_geo_types']})")
+        else:
+            print(f"  NOT PRODUCED: {result['manifest_row']['status']}")
+
+        for fs in result["feature_status_rows"]:
+            print(f"  feature {fs['face']}/{fs['type']} u={fs['u_mm']} v={fs['v_mm']}: "
+                  f"{fs['status']}" + (f" ({fs['reason']})" if fs["reason"] else ""))
 
     fields = build_manifest_fields(FORMATS, numeric_fields=NUMERIC_FIELDS)
     write_manifest_csv(manifest_rows, out_dir / "manifest.csv", fields)
     write_manifest_xlsx(manifest_rows, out_dir / "manifest.xlsx", fields, numeric_fields=NUMERIC_FIELDS)
-    print(f"\nmanifest yazildi: {out_dir / 'manifest.csv'}")
+    write_manifest_csv(all_feature_status, out_dir / "features_manifest.csv", FEATURE_FIELDS)
+    print(f"\nmanifest written: {out_dir / 'manifest.csv'}")
+    print(f"features_manifest written: {out_dir / 'features_manifest.csv'}")
 
 
 try:

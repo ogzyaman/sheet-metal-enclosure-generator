@@ -1,0 +1,4 @@
+variant_id,face,type,u_mm,v_mm,size1_mm,size2_mm,rotation_deg
+A,base,hole,22,17,4,,
+A,front,rect,27,22,12,6,0
+A,right,slot,22,22,15,3,0
