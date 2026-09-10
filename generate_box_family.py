@@ -9,7 +9,8 @@ boxes.csv columns:
   thickness_mm, bend_radius_mm, k_factor
 
 features.csv columns:
-  variant_id, face, type, u_mm, v_mm, size1_mm, size2_mm, rotation_deg
+  variant_id, face, type, u_mm, v_mm, size1_mm, size2_mm, rotation_deg,
+  count_u, count_v, pitch_u_mm, pitch_v_mm
   face: base | front (y=0) | back | left (x=0) | right
   type: hole (size1=diameter) | slot (size1=TOTAL length, size2=width,
         rotation 0 = long axis horizontal) | rect (size1=horizontal,
@@ -20,23 +21,31 @@ features.csv columns:
     wall: viewed from outside; u from the wall's left inner edge
           (horizontal), v from the base's top surface (z=T) upward.
 
+  count_u/count_v/pitch_u_mm/pitch_v_mm: optional grid repeat, blank
+  defaults to 1, 1, 0, 0 (a single instance, existing rows keep working
+  unchanged). u,v is the CENTER of the whole grid; instances are laid
+  out symmetrically around it:
+    u_i = u + (i - (count_u-1)/2) * pitch_u   for i in 0..count_u-1
+    v_j = v + (j - (count_v-1)/2) * pitch_v   for j in 0..count_v-1
+
 Conversion (SheetMetal input):
   L = inner_length - 2R, W = inner_width - 2R, leg = inner_height - R
 
-Validation (before production). w,h = the feature's total horizontal/
-vertical footprint after rotation:
-  base: R <= u-w/2  and  u+w/2 <= inner_length - R
-        R <= v-h/2  and  v+h/2 <= inner_width - R
-  wall: R <= u-w/2  and  u+w/2 <= wall's inner span - R
-        R <= v-h/2  and  v+h/2 <= inner_height   (no -R at the top --
+Validation (before production) runs on EVERY grid instance separately.
+w,h = the feature's total horizontal/vertical footprint after rotation:
+  base: R <= u_i-w/2  and  u_i+w/2 <= inner_length - R
+        R <= v_j-h/2  and  v_j+h/2 <= inner_width - R
+  wall: R <= u_i-w/2  and  u_i+w/2 <= wall's inner span - R
+        R <= v_j-h/2  and  v_j+h/2 <= inner_height   (no -R at the top --
         the open rim is not a bend zone)
 
-If ANY feature row for a variant fails validation, that whole variant
-is NOT produced: no STEP/DXF are written, and any STEP/DXF left over
-from a previous run for that variant are deleted first. manifest.csv
-records status="failed: <which feature, why>" for that variant.
-features_manifest.csv still records the outcome of every feature row
-independently, regardless of whether the variant as a whole was built.
+If ANY grid instance of ANY feature row for a variant fails validation,
+that whole variant is NOT produced: no STEP/DXF are written, and any
+STEP/DXF left over from a previous run for that variant are deleted
+first. manifest.csv records status="failed: <which feature, which
+instance (i,j), why>" for that variant. features_manifest.csv still
+records the outcome of every feature row independently, regardless of
+whether the variant as a whole was built.
 
 Per successful variant: STEP + layered DXF (CUT/BEND) + manifest.py
 (bundled in this repo, no cadkit dependency). Base-face selection:
@@ -75,7 +84,8 @@ FORMATS = ["step", "dxf"]
 
 FEATURE_FIELDS = [
     "variant_id", "face", "type", "u_mm", "v_mm", "size1_mm", "size2_mm",
-    "rotation_deg", "status", "reason",
+    "rotation_deg", "count_u", "count_v", "pitch_u_mm", "pitch_v_mm",
+    "status", "reason",
 ]
 
 
@@ -261,10 +271,22 @@ def build_feature_cutter(ftype, size1, size2, rotation_deg, center, p_hat, q_hat
     raise ValueError(f"unknown feature type: {ftype}")
 
 
+def grid_samples(u, v, count_u, count_v, pitch_u, pitch_v):
+    """Symmetric grid of (i, j, u_i, v_j) instances centered on (u, v)."""
+    samples = []
+    for i in range(count_u):
+        u_i = u + (i - (count_u - 1) / 2.0) * pitch_u
+        for j in range(count_v):
+            v_j = v + (j - (count_v - 1) / 2.0) * pitch_v
+            samples.append((i, j, u_i, v_j))
+    return samples
+
+
 def validate_features(feature_rows, L, W, R, inner_length, inner_width, inner_height):
-    """Validates every feature row independently (no geometry touched
-    yet). Returns a list of parsed dicts, each carrying its own
-    status/reason plus (if valid) the fields needed to build its cutter."""
+    """Validates every instance of every feature row independently (no
+    geometry touched yet). Returns a list of parsed dicts, each carrying
+    its own status/reason plus (if valid) the grid instances needed to
+    build its cutters."""
     parsed_rows = []
     for row in feature_rows:
         face = row["face"].strip()
@@ -274,11 +296,18 @@ def validate_features(feature_rows, L, W, R, inner_length, inner_width, inner_he
         size1 = float(row["size1_mm"])
         size2 = float(row["size2_mm"]) if row.get("size2_mm") not in (None, "") else 0.0
         rotation = float(row["rotation_deg"]) if row.get("rotation_deg") not in (None, "") else 0.0
+        count_u = int(row["count_u"]) if row.get("count_u") not in (None, "") else 1
+        count_v = int(row["count_v"]) if row.get("count_v") not in (None, "") else 1
+        pitch_u = float(row["pitch_u_mm"]) if row.get("pitch_u_mm") not in (None, "") else 0.0
+        pitch_v = float(row["pitch_v_mm"]) if row.get("pitch_v_mm") not in (None, "") else 0.0
 
         parsed = {
             "variant_id": row["variant_id"], "face": face, "type": ftype,
             "u_mm": u, "v_mm": v, "size1_mm": size1, "size2_mm": size2,
-            "rotation_deg": rotation, "status": "ok", "reason": "",
+            "rotation_deg": rotation,
+            "count_u": count_u, "count_v": count_v,
+            "pitch_u_mm": pitch_u, "pitch_v_mm": pitch_v,
+            "status": "ok", "reason": "", "instances": [],
         }
 
         try:
@@ -295,13 +324,26 @@ def validate_features(feature_rows, L, W, R, inner_length, inner_width, inner_he
                 vert_max = inner_height
                 vert_top_margin = 0.0
 
-            ok_u = (R <= u - w / 2) and (u + w / 2 <= horiz_max - R)
-            ok_v = (R <= v - h / 2) and (v + h / 2 <= vert_max - vert_top_margin)
+            instances = grid_samples(u, v, count_u, count_v, pitch_u, pitch_v)
+            failures = []
+            for i, j, u_i, v_j in instances:
+                ok_u = (R <= u_i - w / 2) and (u_i + w / 2 <= horiz_max - R)
+                ok_v = (R <= v_j - h / 2) and (v_j + h / 2 <= vert_max - vert_top_margin)
+                if not ok_u:
+                    failures.append(
+                        f"instance(i={i},j={j}) u out of range: u={u_i} w={w:.4f} "
+                        f"allowed=[{R},{horiz_max - R}]"
+                    )
+                elif not ok_v:
+                    failures.append(
+                        f"instance(i={i},j={j}) v out of range: v={v_j} h={h:.4f} "
+                        f"allowed=[{R},{vert_max - vert_top_margin}]"
+                    )
 
-            if not ok_u:
-                raise ValueError(f"u out of range: u={u} w={w:.4f} allowed=[{R},{horiz_max - R}]")
-            if not ok_v:
-                raise ValueError(f"v out of range: v={v} h={h:.4f} allowed=[{R},{vert_max - vert_top_margin}]")
+            if failures:
+                raise ValueError("; ".join(failures))
+
+            parsed["instances"] = [(u_i, v_j) for _, _, u_i, v_j in instances]
 
         except Exception as e:
             parsed["status"] = "failed"
@@ -312,20 +354,21 @@ def validate_features(feature_rows, L, W, R, inner_length, inner_width, inner_he
 
 
 def cut_features(box_shape, parsed_rows, L, W, R, T):
-    """Cuts every (already validated) feature into the shape, in order.
-    Assumes all rows in parsed_rows have status == 'ok'."""
+    """Cuts every instance of every (already validated) feature into the
+    shape, in order. Assumes all rows in parsed_rows have status == 'ok'."""
     shape = box_shape
     for row in parsed_rows:
-        center, p_hat, q_hat, n_hat = face_geometry(row["face"], row["u_mm"], row["v_mm"], L, W, R, T, shape)
         depth = 4.0 if row["face"] == "base" else 2.0
-        cutter = build_feature_cutter(
-            row["type"], row["size1_mm"], row["size2_mm"], row["rotation_deg"],
-            center, p_hat, q_hat, n_hat, depth,
-        )
-        new_shape = shape.cut(cutter)
-        if not new_shape.isValid():
-            raise SystemExit(f"STOP: shape invalid after cutting feature {row}.")
-        shape = new_shape
+        for u_i, v_j in row["instances"]:
+            center, p_hat, q_hat, n_hat = face_geometry(row["face"], u_i, v_j, L, W, R, T, shape)
+            cutter = build_feature_cutter(
+                row["type"], row["size1_mm"], row["size2_mm"], row["rotation_deg"],
+                center, p_hat, q_hat, n_hat, depth,
+            )
+            new_shape = shape.cut(cutter)
+            if not new_shape.isValid():
+                raise SystemExit(f"STOP: shape invalid after cutting feature {row} instance ({u_i},{v_j}).")
+            shape = new_shape
     return shape
 
 
@@ -504,7 +547,8 @@ def main():
     for row in box_rows:
         result = build_variant(row, features_by_variant, out_dir)
         manifest_rows.append(result["manifest_row"])
-        all_feature_status.extend(result["feature_status_rows"])
+        for fs in result["feature_status_rows"]:
+            all_feature_status.append({k: v for k, v in fs.items() if k in FEATURE_FIELDS})
 
         print(f"--- {result['variant_id']} ---")
         print(f"  SheetMetal input: L={result['L']:.4f} W={result['W']:.4f} leg={result['leg']:.4f}")
