@@ -1,0 +1,6 @@
+variant_id,face,type,u_mm,v_mm,size1_mm,size2_mm,rotation_deg,count_u,count_v,pitch_u_mm,pitch_v_mm
+showcase,front,slot,20,15,10,4,0,,,,
+showcase,front,hole,40,15,8,,,,,,
+showcase,front,rect,80,25,20,10,0,,,,
+showcase,right,slot,32,22,20,3,0,1,5,,6
+showcase,base,hole,52,32,3.2,,,2,2,80,40
