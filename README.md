@@ -74,6 +74,40 @@ features are checked with their rotated extent. If any
 feature of a variant fails, that variant is not generated at all and the
 manifest gives the reason. A part with a missing hole is worse than no part.
 
+## Failure handling
+
+A variant can fail for two different reasons, and both are handled the
+same way: the manifest gets a `failed: <reason>` row for that variant,
+and the run continues with the rest of the table.
+
+- **Feature fit** (see Validation above): checked before any geometry is
+  touched.
+- **Geometry construction**: the folded shape turns out invalid, the base
+  face can't be identified unambiguously, a wall face can't be found, or
+  a feature's cut-through margin would reach the opposite wall. These are
+  problems with that one variant's own numbers (a bend radius or
+  thickness that doesn't suit its enclosure), not with the script, so
+  they're recorded and skipped exactly like a feature-fit failure --
+  never allowed to stop the batch.
+
+Guarantees that follow from this:
+
+- A variant's own previous STEP/DXF (from an earlier run) are only
+  touched once that variant is *conclusively* going to succeed or fail --
+  never speculatively at the start of its build. A failed rebuild never
+  deletes a working file without a replacement ready; a successful
+  rebuild only overwrites the old files once the new STEP and DXF are
+  both written.
+- `manifest.csv`, `manifest.xlsx` and `features_manifest.csv` are written
+  for every variant that was actually attempted, even if a later variant
+  in the same run hits an error the script has no name for and has to
+  stop. The files on disk are never left describing a run that didn't
+  happen, or silently missing a variant that did run.
+- An error the script has no name for (a bug, or a FreeCAD/SheetMetal
+  failure outside the cases listed above) still stops the whole run --
+  but only after the manifest for everything processed so far has been
+  written.
+
 ## Verification
 
 - Inside dimensions measured on the generated 3D models match the input
