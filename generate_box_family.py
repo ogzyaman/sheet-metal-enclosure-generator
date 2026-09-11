@@ -353,12 +353,43 @@ def validate_features(feature_rows, L, W, R, inner_length, inner_width, inner_he
     return parsed_rows
 
 
+CUT_THROUGH_MARGIN_MM = 1.0  # clearance the cutter must exceed on each face of the sheet
+
+
 def cut_features(box_shape, parsed_rows, L, W, R, T):
     """Cuts every instance of every (already validated) feature into the
-    shape, in order. Assumes all rows in parsed_rows have status == 'ok'."""
+    shape, in order. Assumes all rows in parsed_rows have status == 'ok'.
+
+    depth = T + 2*CUT_THROUGH_MARGIN_MM, derived from the sheet thickness
+    T -- the previous fixed 4.0mm (base) / 2.0mm (wall) left holes as
+    blind pockets whenever T exceeded them (T>4 base, T>2 wall), and at
+    T==2 a wall cutter's end faces landed exactly on the sheet's own
+    faces (coincident-face boolean -- the same class of defect as the
+    hole_dia==min(length,width) exact-equality case in lib/cadkit, see
+    lib/CLAUDE.md). Base and walls are the same bent sheet, so the same
+    T/margin applies to both.
+
+    Overshoot safety: a cutter's n_hat is always orthogonal to the
+    feature's own (u, v) plane, where validate_features already keeps an
+    R margin from every bend/corner -- extra depth travels only along the
+    thickness axis, never into a bend region. Outward (away from the
+    part) always exits into free space regardless of margin size. Inward,
+    a base cutter exits into the open-topped interior (nothing to hit).
+    Inward, a wall cutter travels toward the OPPOSITE wall -- the one
+    real risk -- so it's checked against L/W below, which are already
+    smaller than the true interior clearance (inner_length/inner_width
+    minus 2R) and so a conservative (stricter) stand-in for it."""
+    opposite_wall_span = {"front": W, "back": W, "left": L, "right": L}
+
     shape = box_shape
+    depth = T + 2 * CUT_THROUGH_MARGIN_MM
     for row in parsed_rows:
-        depth = 4.0 if row["face"] == "base" else 2.0
+        if row["face"] != "base" and CUT_THROUGH_MARGIN_MM >= opposite_wall_span[row["face"]]:
+            raise SystemExit(
+                f"STOP: cut-through margin {CUT_THROUGH_MARGIN_MM}mm too large for face "
+                f"{row['face']} (interior span {opposite_wall_span[row['face']]:.3f}mm) -- "
+                f"would reach the opposite wall."
+            )
         for u_i, v_j in row["instances"]:
             center, p_hat, q_hat, n_hat = face_geometry(row["face"], u_i, v_j, L, W, R, T, shape)
             cutter = build_feature_cutter(
