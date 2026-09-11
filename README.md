@@ -68,11 +68,33 @@ fabricator's value and regenerate.
 
 ## Validation
 
-Before anything is built, every feature, and every instance of a grid, is
-checked to lie on the flat part of its face, clear of the bends. Rotated
-features are checked with their rotated extent. If any
-feature of a variant fails, that variant is not generated at all and the
-manifest gives the reason. A part with a missing hole is worse than no part.
+Before anything is built, every boxes.csv row is checked, and -- if that
+passes -- every feature and every instance of a grid is checked.
+
+**Box dimensions.** Each check below is either a geometric necessity or a
+measured failure point in this SheetMetal build:
+
+| check | why |
+|---|---|
+| all six numeric columns present and parse as numbers | a blank or mistyped cell would otherwise reach FreeCAD as a raw exception |
+| `thickness_mm > 0` | `thickness_mm <= 0` raises a raw FreeCAD error while building the base plate (measured at `0` and `-1.5`) |
+| `bend_radius_mm >= 0.1mm` | the flat-pattern step raises a raw error at `bend_radius_mm = 0.001mm` (measured); the floor is ~100x that failure point and still far below any real bend radius |
+| `inner_length_mm > 2 * bend_radius_mm`, and the same for `inner_width_mm` | the base plate is a rectangle of these net dimensions; exactly `0` raises a raw error, and a negative value folds the box inside-out without raising anything -- which then crashes the interior-measurement step instead |
+| `inner_height_mm > bend_radius_mm` | the wall's own extension length beyond the bend; `<= 0` raises the same class of raw error as `thickness_mm` |
+
+A row that fails any of these gets `status="failed: <reason>"` in the
+manifest, exactly like a feature-fit failure -- the rest of the table
+still runs. There is no minimum enclosure size beyond that: a wall's
+own face is picked by *position* (the outermost face on that side --
+the same normal-plus-position pattern used to pick the base face for
+the flat pattern), not by how large the face is, so a small but
+otherwise buildable enclosure is never rejected for being small.
+
+**Features.** Every feature, and every instance of a grid, is checked to
+lie on the flat part of its face, clear of the bends. Rotated features
+are checked with their rotated extent. If any feature of a variant
+fails, that variant is not generated at all and the manifest gives the
+reason. A part with a missing hole is worse than no part.
 
 ## Failure handling
 
@@ -149,3 +171,25 @@ Example, run from inside this directory, using the showcase input:
   bending away from the viewer. This follows from the geometry and has not
   been confirmed on a physical part.
 - Output files of a variant removed from the input table are not deleted.
+- The wall-face rule (find_wall_outer: the single most extreme matching
+  face on a side) assumes the wall's own outer skin really is the most
+  extreme axis-aligned face on its side. Measured to hold at any ordinary
+  or even generously oversized thickness (checked up to `thickness_mm`
+  30-40mm against `bend_radius_mm` as small as 2mm, all exact matches to
+  the input); it was this same rule, replacing an area cutoff, that fixed
+  an earlier version of this limitation where `thickness_mm` comparable
+  to `bend_radius_mm` silently shifted the measured interior dimensions.
+  It still breaks at genuinely absurd proportions -- `thickness_mm` at
+  or beyond the wall's own `leg` (inner_height_mm - bend_radius_mm), e.g.
+  200mm+ thick "sheet" metal -- where the corner geometry stops producing
+  a well-formed wall at all and some other face becomes the extreme
+  match. No real sheet-metal part is anywhere near that thickness.
+- Similarly, an `inner_length_mm` (or `inner_width_mm`) small enough that
+  the resulting `L` (or `W`) drops below `thickness_mm` -- opposite walls
+  closer together than the material itself is thick, which validate_box()
+  only excludes at `L <= 0` / `W <= 0`, not at this narrower boundary --
+  can also confuse the wall-face rule the same way. Both of these are
+  proportions no real enclosure would ever call for; validate_box()
+  deliberately does not add a rule for either, since neither reduced to
+  a clean, confidently-measured threshold the way the checks it does
+  enforce did (see Validation above).

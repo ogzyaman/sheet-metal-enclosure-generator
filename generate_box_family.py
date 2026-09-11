@@ -31,6 +31,19 @@ features.csv columns:
 Conversion (SheetMetal input):
   L = inner_length - 2R, W = inner_width - 2R, leg = inner_height - R
 
+Every boxes.csv row is validated (validate_box(), below) before any
+geometry is built: all six numeric columns present and parseable,
+thickness_mm > 0, bend_radius_mm >= 0.1mm, L > 0, and leg > 0 (W > 0 is
+the same check as L > 0, mirrored onto the width). Each check is either
+a geometric necessity (a rectangle needs a positive side) or a measured
+failure point in this SheetMetal build (see validate_box()'s docstring
+for the numbers) -- a row that fails is skipped exactly like a
+feature-fit failure below, never a raw traceback. There is no minimum
+enclosure size beyond that: measure_interior()/find_wall_mid() (below)
+pick a wall's own face by position (find_wall_outer()), not by how
+large it is, so a small but otherwise valid box is never rejected for
+being small.
+
 Validation (before production) runs on EVERY grid instance separately.
 w,h = the feature's total horizontal/vertical footprint after rotation:
   base: R <= u_i-w/2  and  u_i+w/2 <= inner_length - R
@@ -121,31 +134,60 @@ def select_base_face(shape):
     return f"Face{matches[0]}"
 
 
-def measure_interior(shape, L, W, T):
-    """Interior clear dimensions: gap between the INNER faces of each
-    wall pair (x-normal walls give interior length, y-normal walls give
-    interior width), and interior height = wall top (shape ZMax) minus
-    base top (z=T)."""
-    x_faces, y_faces = [], []
+def find_wall_outer(shape, axis, positive_side, threshold):
+    """The wall's own outer-skin planar face on the given side of
+    `threshold` (positive_side selects the face with the LARGEST
+    coordinate along `axis`; the other side selects the SMALLEST) --
+    deterministic by construction, the same normal+position pattern
+    select_base_face (above) uses, with no area or size heuristic:
+
+    Every corner-relief notch and every wall's own T x leg end cap sits
+    strictly BETWEEN the wall's outer skin and the box interior (measured
+    directly: dumping every axis-aligned planar face of boxes from
+    100x80x40mm down to 40x30x20mm, the outer skin is always the single
+    most extreme match, regardless of box size -- unlike an area cutoff,
+    "furthest from the interior" never depends on how big the wall is).
+    So the single most extreme candidate on a side is always the outer
+    skin, full stop; a tie (more than one face at that extreme) is
+    exactly as ambiguous as select_base_face finding more than one base
+    face, and is rejected the same way."""
+    candidates = []
     for f in shape.Faces:
         if not isinstance(f.Surface, Part.Plane):
             continue
         n = f.Surface.Axis
         c = f.CenterOfMass
-        if f.Area < 1000:
+        if axis == "x" and abs(n.x) > 0.99 and abs(n.y) < 0.01:
+            val = c.x
+        elif axis == "y" and abs(n.y) > 0.99 and abs(n.x) < 0.01:
+            val = c.y
+        else:
             continue
-        if abs(n.x) > 0.99 and abs(n.y) < 0.01:
-            x_faces.append(c.x)
-        elif abs(n.y) > 0.99 and abs(n.x) < 0.01:
-            y_faces.append(c.y)
+        if (val > threshold) == positive_side:
+            candidates.append(val)
+    if not candidates:
+        raise SystemExit(f"no wall face found (axis={axis}, positive_side={positive_side}).")
+    extreme = max(candidates) if positive_side else min(candidates)
+    matches = [v for v in candidates if abs(v - extreme) < 1e-6]
+    if len(matches) != 1:
+        raise SystemExit(
+            f"wall outer-skin rule found {len(matches)} matches (expected 1) "
+            f"(axis={axis}, positive_side={positive_side})."
+        )
+    return extreme
 
-    left = [v for v in x_faces if v < L / 2]
-    right = [v for v in x_faces if v >= L / 2]
-    front = [v for v in y_faces if v < W / 2]
-    back = [v for v in y_faces if v >= W / 2]
 
-    inner_x_lo, inner_x_hi = max(left), min(right)
-    inner_y_lo, inner_y_hi = max(front), min(back)
+def measure_interior(shape, L, W, T):
+    """Interior clear dimensions: each wall's outer skin (find_wall_outer,
+    above) offset inward by the sheet thickness T gives that wall's INNER
+    skin exactly -- the inner and outer skin of a bent sheet are always
+    exactly T apart along the wall's own normal, so the inner skin never
+    needs its own (separately ambiguous) face search. Interior height is
+    wall top (shape ZMax) minus base top (z=T)."""
+    inner_x_lo = find_wall_outer(shape, "x", False, L / 2) + T
+    inner_x_hi = find_wall_outer(shape, "x", True, L / 2) - T
+    inner_y_lo = find_wall_outer(shape, "y", False, W / 2) + T
+    inner_y_hi = find_wall_outer(shape, "y", True, W / 2) - T
 
     inner_length = inner_x_hi - inner_x_lo
     inner_width = inner_y_hi - inner_y_lo
@@ -154,31 +196,12 @@ def measure_interior(shape, L, W, T):
     return inner_length, inner_width, inner_height
 
 
-def find_wall_mid(shape, axis, positive_side, threshold):
-    """Mean coordinate (along `axis`, 'x' or 'y') of the wall's inner+outer
-    skin faces on the given side (positive_side selects > threshold, else
-    < threshold). Same face-detection pattern used throughout this
-    project's exploratory scripts (normal aligned to axis, area large
-    enough to exclude corner-relief slivers)."""
-    vals = []
-    for f in shape.Faces:
-        if not isinstance(f.Surface, Part.Plane):
-            continue
-        n = f.Surface.Axis
-        c = f.CenterOfMass
-        if f.Area < 1000:
-            continue
-        if axis == "x" and abs(n.x) > 0.99 and abs(n.y) < 0.01:
-            val = c.x
-        elif axis == "y" and abs(n.y) > 0.99 and abs(n.x) < 0.01:
-            val = c.y
-        else:
-            continue
-        if (val > threshold) == positive_side:
-            vals.append(val)
-    if not vals:
-        raise SystemExit(f"no wall face found (axis={axis}, positive_side={positive_side}).")
-    return sum(vals) / len(vals)
+def find_wall_mid(shape, axis, positive_side, threshold, T):
+    """Wall mid-thickness coordinate (along `axis`, 'x' or 'y') on the
+    given side: the outer skin (find_wall_outer, above) offset inward by
+    half the sheet thickness."""
+    outer = find_wall_outer(shape, axis, positive_side, threshold)
+    return outer - T / 2.0 if positive_side else outer + T / 2.0
 
 
 def face_geometry(face, u, v, L, W, R, T, box_shape):
@@ -196,22 +219,22 @@ def face_geometry(face, u, v, L, W, R, T, box_shape):
         return center, App.Vector(1, 0, 0), App.Vector(0, 1, 0), App.Vector(0, 0, 1)
     if face == "front":
         cx, cz = u - R, T + v
-        y_mid = find_wall_mid(box_shape, "y", False, W / 2.0)
+        y_mid = find_wall_mid(box_shape, "y", False, W / 2.0, T)
         center = App.Vector(cx, y_mid, cz)
         return center, App.Vector(1, 0, 0), App.Vector(0, 0, 1), App.Vector(0, 1, 0)
     if face == "back":
         cx, cz = (L + R) - u, T + v
-        y_mid = find_wall_mid(box_shape, "y", True, W / 2.0)
+        y_mid = find_wall_mid(box_shape, "y", True, W / 2.0, T)
         center = App.Vector(cx, y_mid, cz)
         return center, App.Vector(-1, 0, 0), App.Vector(0, 0, 1), App.Vector(0, 1, 0)
     if face == "left":
         cy, cz = (W + R) - u, T + v
-        x_mid = find_wall_mid(box_shape, "x", False, L / 2.0)
+        x_mid = find_wall_mid(box_shape, "x", False, L / 2.0, T)
         center = App.Vector(x_mid, cy, cz)
         return center, App.Vector(0, -1, 0), App.Vector(0, 0, 1), App.Vector(1, 0, 0)
     if face == "right":
         cy, cz = u - R, T + v
-        x_mid = find_wall_mid(box_shape, "x", True, L / 2.0)
+        x_mid = find_wall_mid(box_shape, "x", True, L / 2.0, T)
         center = App.Vector(x_mid, cy, cz)
         return center, App.Vector(0, 1, 0), App.Vector(0, 0, 1), App.Vector(1, 0, 0)
     raise ValueError(f"unknown face: {face}")
@@ -423,14 +446,112 @@ def remove_stale_outputs(out_dir, variant_id):
     (out_dir / "dxf" / f"{variant_id}.dxf").unlink(missing_ok=True)
 
 
+# Measured (freecadcmd, this SheetMetal build): a wall's bend unfolds fine
+# at bend_radius_mm=0.0015mm but SheetMetalNewUnfolder.getUnfold() raises
+# "Can't process non-circular single-edge loop" at bend_radius_mm=0.001mm.
+# The floor below is ~100x the measured failure point and still far below
+# any physically real bend radius, so it only ever rejects typo-scale
+# values, never a legitimate one.
+MIN_BEND_RADIUS_MM = 0.1
+
+
+def validate_box(row):
+    """Layer-1 validation for one boxes.csv row, run before any FreeCAD
+    document is created (mirrors validate_features()'s contract for
+    features.csv rows). Returns (values, errors): values has all of
+    NUMERIC_FIELDS as floats (0.0 for any that didn't parse, so the
+    manifest/xlsx writer always gets a real number even for a failed row);
+    errors is empty iff construction may proceed.
+
+    Checks, in order (each stage assumes the previous one held):
+      1. every field present and numeric
+      2. thickness_mm > 0 -- required for SMBaseBend at all: thickness<=0
+         raises a raw OCCError ("NULL shape") while building the base,
+         measured directly (thickness_mm=0 and thickness_mm=-1.5 both do
+         this; there is no boundary to find, 0 and below simply don't
+         produce a shape).
+      3. bend_radius_mm >= MIN_BEND_RADIUS_MM -- see constant above.
+      4. L = inner_length_mm - 2*bend_radius_mm > 0, and symmetrically
+         W = inner_width_mm - 2*bend_radius_mm > 0 -- the base sketch is a
+         rectangle L x W; at L==0 (or W==0) SMBaseBend raises a raw
+         OCCError ("Both points are equal", measured) building a
+         zero-width rectangle, and negative L/W silently fold the box
+         inside-out (still isValid()==True, but crashes measure_interior
+         with the exact ValueError this validation exists to prevent).
+      5. leg = inner_height_mm - bend_radius_mm > 0 -- SMBendWall's own
+         wall-extension length; leg<=0 raises the same raw OCCError as
+         thickness<=0 (measured at inner_height_mm==bend_radius_mm and
+         below).
+
+    There used to be a 6th check here (both walls' net area > 1000mm^2),
+    added because measure_interior()/find_wall_mid() picked their walls'
+    faces by an Area<1000 cutoff -- which rejected perfectly buildable
+    small enclosures (e.g. 60x40x25mm, R=2mm) along with the actually
+    degenerate ones. Fixed at the source instead: those two functions now
+    select the wall's outer-skin face by position (find_wall_outer,
+    above), which is well-defined at any box size, so there is nothing
+    left for this layer to reject.
+    """
+    values = {}
+    errors = []
+    for field in NUMERIC_FIELDS:
+        raw = (row.get(field) or "").strip()
+        if not raw:
+            errors.append(f"'{field}' is missing")
+            values[field] = 0.0
+            continue
+        try:
+            values[field] = float(raw)
+        except ValueError:
+            errors.append(f"'{field}' is not a number: {raw!r}")
+            values[field] = 0.0
+    if errors:
+        return values, errors
+
+    inner_length = values["inner_length_mm"]
+    inner_width = values["inner_width_mm"]
+    inner_height = values["inner_height_mm"]
+    T = values["thickness_mm"]
+    R = values["bend_radius_mm"]
+
+    if T <= 0:
+        errors.append(f"thickness_mm must be > 0 (got {T})")
+    if R < MIN_BEND_RADIUS_MM:
+        errors.append(f"bend_radius_mm must be >= {MIN_BEND_RADIUS_MM}mm (got {R})")
+    if errors:
+        return values, errors
+
+    L = inner_length - 2 * R
+    W = inner_width - 2 * R
+    leg = inner_height - R
+
+    if L <= 0:
+        errors.append(
+            f"inner_length_mm must be > 2*bend_radius_mm (inner_length_mm={inner_length}, "
+            f"bend_radius_mm={R} -> L={L:.4f})"
+        )
+    if W <= 0:
+        errors.append(
+            f"inner_width_mm must be > 2*bend_radius_mm (inner_width_mm={inner_width}, "
+            f"bend_radius_mm={R} -> W={W:.4f})"
+        )
+    if leg <= 0:
+        errors.append(
+            f"inner_height_mm must be > bend_radius_mm (inner_height_mm={inner_height}, "
+            f"bend_radius_mm={R} -> leg={leg:.4f})"
+        )
+    return values, errors
+
+
 def build_variant(row, features_by_variant, out_dir):
-    variant_id = row["variant_id"]
-    inner_length = float(row["inner_length_mm"])
-    inner_width = float(row["inner_width_mm"])
-    inner_height = float(row["inner_height_mm"])
-    T = float(row["thickness_mm"])
-    R = float(row["bend_radius_mm"])
-    K = float(row["k_factor"])
+    variant_id = row.get("variant_id", "")
+    values, box_errors = validate_box(row)
+    inner_length = values["inner_length_mm"]
+    inner_width = values["inner_width_mm"]
+    inner_height = values["inner_height_mm"]
+    T = values["thickness_mm"]
+    R = values["bend_radius_mm"]
+    K = values["k_factor"]
 
     L = inner_length - 2 * R
     W = inner_width - 2 * R
@@ -462,6 +583,9 @@ def build_variant(row, features_by_variant, out_dir):
                 "status": f"failed: {reason}",
             },
         }
+
+    if box_errors:
+        return failed_result("; ".join(box_errors))
 
     # Filled in as the pipeline below progresses, so that if a SystemExit
     # lands partway through, the except block can report whatever was
