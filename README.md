@@ -14,7 +14,8 @@ For every row in the enclosure table:
 
 - `step/<variant>.step`: the folded part, in mm.
 - `dxf/<variant>.dxf`: the flat pattern, in mm. Cut contours are on layer
-  `CUT`, bend lines on layer `BEND`. Geometry is lines, arcs and circles
+  `CUT`, bend lines on layer `BEND`. Each bend line is the centerline of
+  its bend zone, not a tangent line. Geometry is lines, arcs and circles
   only, no splines.
 - `manifest.csv` and `manifest.xlsx`: one row per variant with its
   parameters, file names and status. `features_manifest.csv` records the
