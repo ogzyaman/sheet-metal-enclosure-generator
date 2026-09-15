@@ -398,9 +398,9 @@ def cut_features(box_shape, parsed_rows, L, W, R, T):
     blind pockets whenever T exceeded them (T>4 base, T>2 wall), and at
     T==2 a wall cutter's end faces landed exactly on the sheet's own
     faces (coincident-face boolean -- the same class of defect as the
-    hole_dia==min(length,width) exact-equality case in lib/cadkit, see
-    lib/CLAUDE.md). Base and walls are the same bent sheet, so the same
-    T/margin applies to both.
+    hole_dia==min(length,width) exact-equality case in lib/cadkit).
+    Base and walls are the same bent sheet, so the same T/margin
+    applies to both.
 
     Overshoot safety: a cutter's n_hat is always orthogonal to the
     feature's own (u, v) plane, where validate_features already keeps an
